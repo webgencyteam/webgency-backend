@@ -73,7 +73,7 @@ app.post('/create-checkout', async (req, res) => {
         extraVersions: String(extraVersions || 0),
       },
       // Where to send the customer after payment
-      success_url: 'https://webgencyinvitations.com/thank-you?session_id={CHECKOUT_SESSION_ID}',
+      success_url: 'https://webgencyinvitations.com/paymentsuccessful?session_id={CHECKOUT_SESSION_ID}',
       cancel_url: 'https://webgencyinvitations.com/order',
     });
 
