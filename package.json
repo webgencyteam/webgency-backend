@@ -1,7 +1,7 @@
 {
   "name": "webgency-checkout",
-  "version": "1.0.0",
-  "description": "Webgency Stripe Checkout backend",
+  "version": "2.0.0",
+  "description": "Webgency Stripe Checkout + Google Sheets backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
     "stripe": "^14.0.0"
   },
   "engines": {
