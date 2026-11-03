@@ -18,6 +18,7 @@ const rateLimit = require('express-rate-limit');
 const { priceOrder } = require('./pricing');
 
 const app    = express();
+app.set('trust proxy', 1); // Railway sits in front of the app: rate limits use each visitor's real IP
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ── CORS: only your website can call this API ─────────────────
