@@ -1,6 +1,6 @@
 // ============================================================
-// WEBGENCY — Stripe Checkout Backend v5
-// SECURITY: Rate limiting + amount validation + secret key
+// WEBGENCY — Stripe Checkout Backend v7
+// SECURITY: Rate limiting + SERVER-SIDE PRICING + secret key
 //           + formula injection protection + input sanitization
 // Node.js 18+
 // npm install stripe cors express node-fetch express-rate-limit
@@ -15,6 +15,7 @@ const express   = require('express');
 const Stripe    = require('stripe');
 const cors      = require('cors');
 const rateLimit = require('express-rate-limit');
+const { priceOrder } = require('./pricing');
 
 const app    = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
@@ -28,6 +29,91 @@ app.use(cors({
     'https://tilda.ws',
   ]
 }));
+
+// ── STRIPE WEBHOOK (abandoned checkout reminders) ───────────
+// Stripe calls this when an unpaid checkout expires (after 1 hour).
+// We verify Stripe's signature, then hand the details to Zapier,
+// which sends Mary's reminder emails.
+// Railway variables needed:
+//   STRIPE_WEBHOOK_SECRET — from Stripe > Developers > Webhooks (starts with whsec_)
+//   REMINDER_HOOK_URL     — Zapier "Catch Hook" URL for the reminder Zap
+//   EXTRAS_HOOK_URL       — Zapier "Catch Hook" URL for the "Paid extra" Zap
+// Stripe events to send: checkout.session.expired + checkout.session.completed
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.warn('Webhook signature failed:', err.message);
+    return res.status(400).send('Bad signature');
+  }
+  try {
+    if (event.type === 'checkout.session.expired') {
+      const s = event.data.object;
+      const email = s.customer_email || (s.customer_details && s.customer_details.email) || '';
+      const recoveryUrl = s.after_expiration && s.after_expiration.recovery && s.after_expiration.recovery.url;
+      if (email && recoveryUrl && process.env.REMINDER_HOOK_URL) {
+        const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+        const name = ((s.metadata && s.metadata.customerName) || '').trim();
+        await fetch(process.env.REMINDER_HOOK_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email, firstName: name.split(' ')[0] || '', name,
+            design: (s.metadata && s.metadata.designType) || '',
+            amount: (s.amount_total || 0) / 100, recoveryUrl, expiredAt: new Date().toISOString()
+          })
+        });
+        console.log('Reminder hand-off sent for', email);
+      }
+    }
+    // Extras bought later from the client portal (Stripe Payment Links).
+    // Orders from the website form are not Payment Links, so they are ignored here.
+    if (event.type === 'checkout.session.completed') {
+      const s = event.data.object;
+      // Only links opened from the client portal carry the project id (client_reference_id),
+      // so other Payment Links you use elsewhere never post anything in the portal.
+      if (s.payment_link && s.client_reference_id && s.payment_status === 'paid' && process.env.EXTRAS_HOOK_URL) {
+        const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+        let items = '';
+        try {
+          const li = await stripe.checkout.sessions.listLineItems(s.id, { limit: 20 });
+          items = li.data.map(x => (x.quantity > 1 ? x.quantity + ' × ' : '') + (x.description || '')).join(', ');
+        } catch (e) { console.warn('Line items not read:', e.message); }
+        const d = s.customer_details || {};
+        await fetch(process.env.EXTRAS_HOOK_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            projectId: s.client_reference_id,
+            email: d.email || s.customer_email || '',
+            name: d.name || '',
+            items: items || 'an extra',
+            amount: (s.amount_total || 0) / 100,
+            currency: String(s.currency || 'eur').toUpperCase(),
+            sessionId: s.id,
+            paidAt: new Date().toISOString()
+          })
+        });
+        console.log('Paid extra hand-off sent:', items, s.client_reference_id || d.email);
+      }
+    }
+  } catch (err) { console.error('Webhook handling error:', err.message); }
+  res.json({ received: true });
+});
+
+// ── HAS THIS EMAIL PAID? (used by the 2nd reminder) ─────────
+// GET /order-status?email=...&key=API_SECRET  →  { paid: true|false }
+app.get('/order-status', async (req, res) => {
+  try {
+    if (!process.env.API_SECRET || req.query.key !== process.env.API_SECRET) return res.status(403).json({ error: 'Forbidden' });
+    const email = String(req.query.email || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'Missing email' });
+    const since = Math.floor(Date.now() / 1000) - 3 * 24 * 3600;
+    const list = await stripe.checkout.sessions.list({ created: { gte: since }, limit: 100 });
+    const paid = list.data.some(x => x.payment_status === 'paid' &&
+      String(x.customer_email || (x.customer_details && x.customer_details.email) || '').toLowerCase() === email);
+    res.json({ paid });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 app.use(express.json({ limit: '50kb' })); // reject oversized payloads
 
@@ -163,6 +249,23 @@ app.post('/create-checkout', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email' });
     }
 
+    // CHECK 6: Server-side price ───────────────────────────────
+    // The server calculates the price itself from the order, so a
+    // changed price in the browser can never be charged.
+    // Orders from the OLD order form (short codes like "illus") are
+    // still accepted with the old range check, so nothing breaks
+    // while the new form is being pasted into Tilda.
+    let chargeAmount = amountNum;
+    const priced = priceOrder(req.body);
+    if (priced.error) {
+      console.warn('Legacy/unknown order, using range check only:', priced.error);
+    } else {
+      if (Math.abs(priced.total - amountNum) > 0.01) {
+        console.warn('Price mismatch: page sent', amountNum, 'server price', priced.total, 'from', req.ip);
+      }
+      chargeAmount = priced.total;
+    }
+
     // CHECK 5: Success URL must be your own domain ──────────────
     // Stops open redirect attacks — nobody can redirect your
     // customers to a fake website after payment.
@@ -177,7 +280,7 @@ app.post('/create-checkout', async (req, res) => {
 
     // All checks passed — log to Sheets (after validation,
     // so bot spam never pollutes your sheet again)
-    logToSheets(req.body).catch(() => {});
+    logToSheets({ ...req.body, amount: chargeAmount }).catch(() => {});
 
     // Build description for Stripe
     const description = [
@@ -195,12 +298,12 @@ app.post('/create-checkout', async (req, res) => {
 
     // Convert euros to cents for Stripe
     // €75 → 75 * 100 = 7500 cents ✓
-    const amountInCents = Math.round(amountNum * 100);
+    const amountInCents = Math.round(chargeAmount * 100);
 
     // Build success URL — must be your own domain
     const finalSuccessUrl = (successUrl && successUrl.startsWith('https://'))
       ? successUrl + '?session_id={CHECKOUT_SESSION_ID}'
-      : 'https://webgencyinvitations.com/paymentsuccessful?session_id={CHECKOUT_SESSION_ID}';
+      : 'https://webgencyinvitations.com/thankyou?session_id={CHECKOUT_SESSION_ID}';
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -227,6 +330,11 @@ app.post('/create-checkout', async (req, res) => {
       },
       success_url: finalSuccessUrl,
       cancel_url:  'https://webgencyinvitations.com/order',
+      // Unpaid checkouts expire after 1 hour. Stripe then creates a
+      // "continue where you left off" link (after_expiration.recovery.url),
+      // used by the reminder emails from Mary (Zapier: checkout.session.expired).
+      expires_at: Math.floor(Date.now() / 1000) + 60 * 60,
+      after_expiration: { recovery: { enabled: true } },
     });
 
     res.json({ url: session.url });
@@ -237,7 +345,7 @@ app.post('/create-checkout', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Webgency checkout server v5 running'));
+app.get('/', (req, res) => res.send('Webgency checkout server v7 running'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server running on port ' + PORT));
