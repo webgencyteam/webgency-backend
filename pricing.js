@@ -17,7 +17,14 @@ const EXTRAS = {
   'Custom AI Video': 40,
   'Custom Domain': 60,
   'Masterpiece Bundle (Custom Illustration + Custom AI Video)': 55,
-  'Express Delivery': null // depends on the package
+  'Express Delivery': null, // depends on the package
+  // Short names used by the order form since 4 Nov 2026 (old names above still accepted)
+  'Music': 15,
+  'Envelope with Initials': 30,
+  'Bespoke Opening': 40,
+  'Illustration (free)': 0,
+  'Extra Illustration': 25,
+  'Masterpiece Bundle (Illustration + AI Video)': 55
 };
 const EXPRESS = { std: 30, template: 30, custom: 50 };
 const LINK_TIERS = [{ min: 1, r: 3 }, { min: 50, r: 2.5 }, { min: 100, r: 2 }, { min: 300, r: 1.5 }];
