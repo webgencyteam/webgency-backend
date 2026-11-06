@@ -39,7 +39,9 @@ app.use(cors({
 //   STRIPE_WEBHOOK_SECRET — from Stripe > Developers > Webhooks (starts with whsec_)
 //   REMINDER_HOOK_URL     — Zapier "Catch Hook" URL for the reminder Zap
 //   EXTRAS_HOOK_URL       — Zapier "Catch Hook" URL for the "Paid extra" Zap
+//   NEW_ORDER_HOOK_URL    — Zapier "Catch Hook" URL for the "Instant client portal" Zap
 // Stripe events to send: checkout.session.expired + checkout.session.completed
+const sentOrders = new Set(); // checkout sessions already handed to Zapier (protects against repeated Stripe events)
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try {
@@ -95,6 +97,44 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
           })
         });
         console.log('Paid extra hand-off sent:', items, s.client_reference_id || d.email);
+      }
+      // New paid order from the website order form → create the client portal right away
+      // (Zapier "Catch Hook" → adds a row to "Webgency — Manual client portals" → portal + access email).
+      const m = s.metadata || {};
+      if (!s.payment_link && m.designType && s.payment_status === 'paid' && process.env.NEW_ORDER_HOOK_URL && !sentOrders.has(s.id)) {
+        sentOrders.add(s.id); // Stripe can repeat an event: never create two portals
+        const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+        const d = s.customer_details || {};
+        const email = (s.customer_email || d.email || '').trim();
+        const amount = Math.round((s.amount_total || 0)) / 100;
+        const date = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Indian/Mauritius' });
+        const post = body => fetch(process.env.NEW_ORDER_HOOK_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+        });
+        const body = JSON.stringify({
+            key: email + '_' + amount,
+            paymentId: s.payment_intent || s.id,
+            date,
+            name: (m.customerName || d.name || '').trim(),
+            email,
+            productData: 'Webgency — ' + m.designType,
+            sections: m.sections || '',
+            customSections: m.customBlocks || '',
+            language: m.lang1 || '',
+            extraLanguages: m.extraLangs || '',
+            extras: m.extras || '',
+            personalLinks: m.personalLinks || '0',
+            extraVersions: m.extraVersions || '0',
+            eventDate: m.eventDate || '',
+            notes: m.notes || '',
+            amount
+        });
+        let r = null;
+        for (let attempt = 0; attempt < 3 && !(r && r.ok); attempt++) { // up to 3 tries if Zapier is briefly unreachable
+          if (attempt) await new Promise(ok => setTimeout(ok, 3000));
+          try { r = await post(body); } catch (e) { console.warn('New order hand-off try failed:', e.message); }
+        }
+        console.log('New order hand-off', r && r.ok ? 'sent:' : 'FAILED:', email, r ? r.status : 'no response');
       }
     }
   } catch (err) { console.error('Webhook handling error:', err.message); }
@@ -161,6 +201,11 @@ function sanitizeAll(data) {
     }
   }
   return clean;
+}
+
+// Turns a list into one short text for Stripe metadata (max 500 characters)
+function list500(v) {
+  return Array.isArray(v) ? v.map(x => sanitize(String(x))).join(', ').substring(0, 500) : '';
 }
 
 // ── HELPER: send row to Google Sheets ────────────────────────
@@ -328,6 +373,13 @@ app.post('/create-checkout', async (req, res) => {
         eventDate:     sanitize(eventDate     || ''),
         personalLinks: String(personalLinks   || 0),
         extraVersions: String(extraVersions   || 0),
+        // Full order details, so the client portal can be created the moment the payment succeeds
+        sections:      list500(sections),
+        customBlocks:  list500(customBlocks),
+        lang1:         sanitize(lang1         || '').substring(0, 100),
+        extraLangs:    list500(extraLangs),
+        extras:        list500(extras),
+        notes:         sanitize(notes         || '').substring(0, 500),
       },
       success_url: finalSuccessUrl,
       cancel_url:  'https://webgencyinvitations.com/order',
